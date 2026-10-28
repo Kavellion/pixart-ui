@@ -569,6 +569,11 @@ def _run_generate(pipe, template, negative, width, height, steps,
             generator = _make_generator(actual_seed)
             image = pipe(
                 prompt=None,
+                # negative_prompt must be None here, not the
+                # pipeline's "" default: check_inputs refuses
+                # a text negative forwarded alongside negative
+                # prompt embeds (Oct 28 2026 PC test).
+                negative_prompt=None,
                 prompt_embeds=prompt_embeds,
                 prompt_attention_mask=prompt_attention_mask,
                 negative_prompt_embeds=negative_prompt_embeds,
