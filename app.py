@@ -64,6 +64,31 @@ Memory design -- read this before touching the loader:
   image. Single-image runs keep the plain one-call path:
   they never had the problem, so they do not change.
 
+  Placement rule (Oct 28, 2026, the batch-slowness fix):
+  the batch path places its encoding tensors EXPLICITLY.
+  encode_prompt is called with device= set to the
+  pipeline's own execution device, and all four returned
+  tensors (prompt embeds, its mask, and the negative pair)
+  are pinned to that device once, before the loop, so every
+  image is generated from embeddings already resident where
+  the transformer runs. Why not leave it to the pipeline:
+  reading the pinned diffusers 0.39.0 wheel
+  (pipeline_pixart_sigma.py) shows __call__ re-passes
+  supplied embeddings through encode_prompt, which moves
+  the two embed tensors to the execution device once per
+  call (its lines 334 and 369) -- but the two attention
+  masks on that pass-through path only ever get repeat/view
+  (lines 340-341 and 373-374), never a device move, so mask
+  residency is the caller's responsibility entirely; and
+  the embeds' residency between the app's own encode and
+  its N separate calls previously rested on encode_prompt's
+  device=None default rather than on anything the app
+  stated. Explicit placement costs one no-op .to() per
+  tensor and removes the whole reliance. (What the wheel
+  does NOT do is shuttle embeddings per denoising step --
+  the loop feeds one concatenated tensor to the transformer
+  throughout, lines 802-804 and 862-869.)
+
   Dtype rule (the SDXL lesson, Oct 27 2026): ONE dtype story.
   Every component loads in float16 and none is ever upcast
   against the others. Diffusers 0.39's PixArt decode line
@@ -82,8 +107,46 @@ width/height values are snapped by the pipeline to the
 nearest bucket internally and the result is resized back, so
 the saved picture always matches the width/height boxes.
 
+LoRA (Oct 28, 2026): one slot, files in loras/. A PixArt
+LoRA is a TRANSFORMER adapter -- it patches the diffusion
+transformer's attention and feed-forward layers. The T5-XXL
+text encoder takes no LoRA, which is why the batch rule
+above survives untouched: prompt embeddings are computed
+from the text encoder alone, so adapter state cannot change
+them, and the encode-once path neither knows nor cares
+whether a LoRA is loaded. (A stub test pins this: the batch
+path passes identical embed arguments with LoRA on and off.)
+
+How the adapter is loaded, honestly: diffusers 0.39.0
+ships NO LoRA API for PixArt -- PixArtSigmaPipeline has no
+load_lora_weights mixin, and its Transformer2DModel lacks
+the PeftAdapterMixin every supported DiT pipeline delegates
+to (both hasattr-verified against the installed wheel).
+What every supported DiT pipeline actually runs underneath
+is that mixin method -- Sana's loader, for one, ends at
+transformer.load_lora_adapter(...) -- so this app calls
+the wheel's own PeftAdapterMixin loader directly on the
+transformer, with the mixin's expected state seeded (see
+_lora_bootstrap). Same code path, same semantics; the peft
+package it runs on is pinned in requirements.txt. Two
+consequences of using the real loader, both verified
+against a real Transformer2DModel at build time:
+  - Offload ordering: when CPU-offload hooks are on the
+    pipeline, the loader removes them, loads the adapter,
+    and re-applies them -- loading under live hooks errors,
+    so the reconcile follows that order exactly.
+  - ONE slot: a second adapter does not load cleanly
+    through the pinned loader (its config inference reads
+    the model's current state dict, which the first
+    injection pollutes with .base_layer paths, and peft
+    then targets no modules). One slot, honestly, instead
+    of a second that fails on real files.
+Adapter state is reconciled at Generate time from the UI
+selection, so a queued run can never inherit an adapter a
+previous run left behind.
+
 Not in this version (see the README's deferred list):
-img2img, inpainting, ControlNet, LoRAs, embeddings, prompt
+img2img, inpainting, ControlNet, embeddings, prompt
 weighting/blending, animation. Diffusers ships no standard
 PixArt img2img pipeline, so there is nothing honest to wire
 those tabs to yet.
@@ -101,6 +164,7 @@ ROOT_DIR = APP_DIR  # flat bundle: app.py sits next to run.bat
 IMAGES_DIR = os.path.join(ROOT_DIR, "images_out")
 FAVORITES_DIR = os.path.join(IMAGES_DIR, "favorites")
 RANDOM_PROMPTS_FILE = os.path.join(ROOT_DIR, "random_prompts.txt")
+LORAS_DIR = os.path.join(ROOT_DIR, "loras")
 
 MODEL_ID = "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
 
@@ -144,6 +208,7 @@ _SIZE_PRESETS = {
 _pipe = None            # loaded once on first Generate
 _pipe_key = None        # the offload flag the loaded pipe used
 _scheduler_config = None  # pristine copy of the shipped config
+_lora_key = None        # filename of the LoRA currently applied
 
 
 # ------------------------------------------------------------------
@@ -363,11 +428,14 @@ def _early(message, last_folder, history):
 def _unload_all():
     """Drop the loaded pipeline and the saved scheduler
     config, and free the memory (VRAM and the RAM the
-    offloaded weights were parked in)."""
-    global _pipe, _pipe_key, _scheduler_config
+    offloaded weights were parked in). The LoRA key resets
+    with the pipe: a fresh transformer carries no adapter,
+    whatever the old one had."""
+    global _pipe, _pipe_key, _scheduler_config, _lora_key
     _pipe = None
     _pipe_key = None
     _scheduler_config = None
+    _lora_key = None
     _free_memory()
 
 
@@ -477,6 +545,195 @@ def _make_generator(seed):
 
 
 # ------------------------------------------------------------------
+# LoRA -- one slot over the transformer (see the header for
+# why one, and for the loading route). The adapter name is
+# fixed: with one slot there is never a second name to track.
+# ------------------------------------------------------------------
+
+LORA_ADAPTER_NAME = "lora0"
+
+
+def _list_loras():
+    """The LoRA dropdown choices: 'None', then every
+    .safetensors file in loras/, sorted (the sibling
+    convention)."""
+    found = []
+    if os.path.isdir(LORAS_DIR):
+        for name in sorted(os.listdir(LORAS_DIR)):
+            if name.lower().endswith(".safetensors"):
+                found.append(name)
+    return ["None"] + found
+
+
+def _refresh_lora(current):
+    """Refresh-list update for the LoRA dropdown: a selection
+    whose file was deleted falls back to 'None'."""
+    import gradio as gr
+    choices = _list_loras()
+    value = current if current in choices else "None"
+    return gr.update(choices=choices, value=value)
+
+
+def _lora_state_text(filename, weight):
+    """settings.txt wording for the applied LoRA state."""
+    if not filename:
+        return "none"
+    return "{} @ {}".format(filename, float(weight))
+
+
+def _lora_bootstrap(transformer):
+    """Seed the state diffusers' PeftAdapterMixin expects to
+    find on the model it loads into. Models that inherit the
+    mixin carry these as class attributes; PixArt's
+    Transformer2DModel does not inherit it (see the header),
+    so the app lends the transformer the mixin's own
+    defaults before calling its loader unbound:
+      _hf_peft_config_loaded -- False until an adapter loads
+        (the loader's unload path resets it to None, which
+        this maps back to False for the next load);
+      _prepare_lora_hotswap_kwargs -- None (no hotswap);
+      _optionally_disable_offloading -- the mixin's
+        classmethod, delegated to the wheel's own helper in
+        diffusers.loaders.lora_base, which removes the
+        pipeline's offload hooks for the load and reports
+        which kind was active so the loader re-applies it.
+    Attributes already present are left alone."""
+    from diffusers.loaders.lora_base import (
+        _func_optionally_disable_offloading)
+    if getattr(transformer, "_hf_peft_config_loaded",
+               None) is None:
+        transformer._hf_peft_config_loaded = False
+    if not hasattr(transformer, "_prepare_lora_hotswap_kwargs"):
+        transformer._prepare_lora_hotswap_kwargs = None
+    if not hasattr(transformer, "_optionally_disable_offloading"):
+        transformer._optionally_disable_offloading = (
+            lambda _pipeline:
+                _func_optionally_disable_offloading(
+                    _pipeline=_pipeline))
+
+
+def _read_lora_state_dict(path, filename):
+    """Read and format-check a LoRA file for the transformer
+    loader. The accepted shape is the diffusers/PEFT format
+    every DiT loader in the pinned wheel consumes: keys of
+    the form [transformer.]<module>.lora_A.weight /
+    .lora_B.weight. A leading 'transformer.' prefix is
+    optional in the file -- it is added here when absent, so
+    both saved shapes load -- and anything else (kohya-style
+    lora_unet_/lora_transformer_ keys, an SD or SDXL file, a
+    mixed-prefix file) is refused with a plain sentence
+    before the loader ever sees it. Raises RuntimeError."""
+    from safetensors.torch import load_file
+    try:
+        state_dict = load_file(path)
+    except Exception as exc:  # noqa: BLE001 -- plain status text
+        raise RuntimeError(
+            "Could not read the LoRA {} ({}). Check the file "
+            "is a .safetensors LoRA in the loras folder, then "
+            "try again.".format(filename, exc))
+    if not state_dict or not all(
+            "lora" in key for key in state_dict):
+        raise RuntimeError(
+            "The file {} does not look like a LoRA (its keys "
+            "are not LoRA layers). Check the file is a PixArt "
+            "LoRA in the loras folder, then try "
+            "again.".format(filename))
+    prefixed = [key.startswith("transformer.")
+                for key in state_dict]
+    if not any(prefixed):
+        state_dict = {"transformer." + key: value
+                      for key, value in state_dict.items()}
+    elif not all(prefixed):
+        raise RuntimeError(
+            "The LoRA {} mixes transformer keys with other "
+            "keys, so it is not a plain PixArt transformer "
+            "LoRA. Check the file is a PixArt LoRA in the "
+            "loras folder, then try again.".format(filename))
+    stripped = [key[len("transformer."):] for key in state_dict]
+    if not any("lora_A" in key for key in stripped) or \
+            not any("lora_B" in key for key in stripped):
+        raise RuntimeError(
+            "The LoRA {} has no transformer LoRA layers. "
+            "Check the file is a PixArt LoRA in the loras "
+            "folder, then try again.".format(filename))
+    return state_dict
+
+
+def _lora_unload(transformer):
+    """Remove every adapter from the transformer, restoring
+    the base modules (the wheel's unload_lora). A transformer
+    with no adapters is left untouched."""
+    if getattr(transformer, "peft_config", None):
+        from diffusers.loaders import PeftAdapterMixin
+        PeftAdapterMixin.unload_lora(transformer)
+
+
+def _reconcile_lora(pipe, filename, weight):
+    """Make the transformer's adapter state match the UI
+    slot, at Generate time, so the state a run uses is
+    exactly what its settings record -- a queued run can
+    never inherit an adapter an earlier run left behind.
+    An unchanged file is not reloaded; its weight is simply
+    re-applied. Returns the settings.txt state text. Raises
+    RuntimeError with a plain sentence when the file fails
+    to load, leaving no adapter applied."""
+    global _lora_key
+    transformer = pipe.transformer
+    if not filename or filename == "None":
+        if _lora_key is not None:
+            _lora_unload(transformer)
+            _lora_key = None
+        return _lora_state_text(None, weight)
+    weight = float(weight)
+    if _lora_key != filename:
+        if _lora_key is not None:
+            _lora_unload(transformer)
+            _lora_key = None
+        state_dict = _read_lora_state_dict(
+            os.path.join(LORAS_DIR, filename), filename)
+        _lora_bootstrap(transformer)
+        from diffusers.loaders import PeftAdapterMixin
+        try:
+            PeftAdapterMixin.load_lora_adapter(
+                transformer, state_dict, prefix="transformer",
+                adapter_name=LORA_ADAPTER_NAME, _pipeline=pipe)
+        except Exception as exc:  # noqa: BLE001 -- plain status
+            _lora_key = None
+            # The wheel's loader takes the pipeline's offload
+            # hooks off before injecting and puts them back
+            # only on success, so a failed load can leave them
+            # off. Put them back: enable_model_cpu_offload
+            # removes existing hooks first, so re-calling it
+            # is safe whether or not the load got that far.
+            if _pipe_key:
+                try:
+                    pipe.enable_model_cpu_offload()
+                except Exception:  # noqa: BLE001 -- best effort
+                    pass
+            raise RuntimeError(
+                "Could not load the LoRA {} ({}). Check the "
+                "file is a PixArt LoRA in the loras folder, "
+                "then try again.".format(filename, exc))
+        _lora_key = filename
+    # The pinned peft does not validate adapter names in
+    # set_adapters (verified at build time: an unknown name
+    # is silently accepted), so the app checks the name
+    # itself before trusting the weight call.
+    if LORA_ADAPTER_NAME not in getattr(
+            transformer, "peft_config", {}):
+        _lora_key = None
+        raise RuntimeError(
+            "Could not apply the LoRA {}: the adapter did "
+            "not register on the transformer. Check the file "
+            "is a PixArt LoRA in the loras folder, then try "
+            "again.".format(filename))
+    from diffusers.loaders import PeftAdapterMixin
+    PeftAdapterMixin.set_adapters(
+        transformer, [LORA_ADAPTER_NAME], [weight])
+    return _lora_state_text(filename, weight)
+
+
+# ------------------------------------------------------------------
 # Random prompt -- random_prompts.txt next to app.py, read
 # fresh on every click; the built-in word banks are the
 # fallback when the file is missing or empty.
@@ -526,6 +783,28 @@ def random_prompt():
 # Generation
 # ------------------------------------------------------------------
 
+def _execution_device(pipe):
+    """The device the pipeline will run its models on: the
+    pipeline's own _execution_device (under CPU offload it
+    resolves through the offload hooks to the GPU),
+    falling back to its plain device attribute. None when
+    neither is known -- callers then leave placement to
+    the pipeline, as before."""
+    device = getattr(pipe, "_execution_device", None)
+    if device is None:
+        device = getattr(pipe, "device", None)
+    return device
+
+
+def _pin_to_device(tensor, device):
+    """Move one encoding tensor to the execution device,
+    once. A tensor already there comes back as itself
+    (torch's own .to() no-op rule); None passes through."""
+    if tensor is None or device is None:
+        return tensor
+    return tensor.to(device)
+
+
 def _run_generate(pipe, template, negative, width, height, steps,
                   guidance, seeds, folder, start=1):
     """One text-to-image generation per seed, each with its
@@ -545,9 +824,20 @@ def _run_generate(pipe, template, negative, width, height, steps,
     loop, and each seed is generated from those same
     embeddings with prompt=None, so the 9.5 GB text encoder
     never fires inside the loop and the CPU-offload hooks
-    never sweep it per image. The returned expanded list
+    never sweep it per image. The encode is placed
+    explicitly: device= goes to encode_prompt and the four
+    returned tensors are pinned to the execution device
+    once before the loop (the header's placement rule).
+    The returned expanded list
     repeats that one expansion once per frame, which is what
-    settings.txt records."""
+    settings.txt records.
+
+    LoRA state is irrelevant to both paths by design: the
+    adapter patches the transformer only (the text encoder
+    takes no LoRA), and the embeddings above come from the
+    text encoder alone -- identical embed arguments are
+    passed whether a LoRA is loaded or not, which the stub
+    tests assert."""
     frame_paths = []
     expanded_list = []
     if len(seeds) > 1:
@@ -557,6 +847,7 @@ def _run_generate(pipe, template, negative, width, height, steps,
         # prompt_attention_mask, negative_prompt_embeds,
         # negative_prompt_attention_mask (the negative pair
         # is None when guidance is off).
+        device = _execution_device(pipe)
         (prompt_embeds, prompt_attention_mask,
          negative_prompt_embeds,
          negative_prompt_attention_mask) = pipe.encode_prompt(
@@ -564,7 +855,21 @@ def _run_generate(pipe, template, negative, width, height, steps,
             do_classifier_free_guidance=float(guidance) > 1.0,
             negative_prompt=negative,
             num_images_per_prompt=1,
+            device=device,
             clean_caption=False)
+        # Placement rule (see the module header): pin all
+        # four encoding tensors to the execution device ONCE,
+        # here, so the whole run generates from embeddings
+        # already resident where the transformer runs -- the
+        # masks included, because the pipeline's pass-through
+        # path never re-places them.
+        prompt_embeds = _pin_to_device(prompt_embeds, device)
+        prompt_attention_mask = _pin_to_device(
+            prompt_attention_mask, device)
+        negative_prompt_embeds = _pin_to_device(
+            negative_prompt_embeds, device)
+        negative_prompt_attention_mask = _pin_to_device(
+            negative_prompt_attention_mask, device)
         for i, actual_seed in enumerate(seeds):
             generator = _make_generator(actual_seed)
             image = pipe(
@@ -616,11 +921,12 @@ def _run_generate(pipe, template, negative, width, height, steps,
 
 def _generate_entries(template, expanded_list, negative, width,
                       height, steps, guidance, sampler, seeds,
-                      offload):
+                      offload, lora_text="none"):
     """settings.txt entries for a text-to-image run. The
     expanded prompt line is what was actually used (the
     template line keeps what was typed). The loader line
-    records which placement path ran."""
+    records which placement path ran, and the loras line
+    records the adapter state the run actually used."""
     return (
         ["prompt: {}".format(template)]
         + _expanded_entries(expanded_list)
@@ -629,7 +935,8 @@ def _generate_entries(template, expanded_list, negative, width,
            "width: {}".format(int(width)),
            "height: {}".format(int(height)),
            "inference_steps: {}".format(int(steps)),
-           "guidance_scale: {}".format(float(guidance))]
+           "guidance_scale: {}".format(float(guidance)),
+           "loras: {}".format(lora_text)]
         + [_seed_entry(seeds),
            "model: {}".format(MODEL_ID),
            "dtype: float16",
@@ -640,7 +947,8 @@ def _generate_entries(template, expanded_list, negative, width,
 
 def generate(prompt_text, negative_text, queue_text, width, height,
              steps, guidance, sampler, seed, batch_name, count,
-             offload, last_folder, history):
+             offload, last_folder, history, lora="None",
+             lora_weight=0.8):
     """Text-to-image generation. Returns (gallery image list,
     status text, history dropdown update, last batch folder,
     history list). The gallery shows the saved frames.
@@ -669,6 +977,13 @@ def generate(prompt_text, negative_text, queue_text, width, height,
         return _early("Model load failed: {}".format(exc),
                       last_folder, history)
     pipe.scheduler = _make_scheduler(sampler)
+    # The adapter state is set once for the whole Generate
+    # (queue lines share it, like every other setting), before
+    # any image runs.
+    try:
+        lora_text = _reconcile_lora(pipe, lora, lora_weight)
+    except Exception as exc:  # noqa: BLE001 -- show it, don't crash
+        return _early(str(exc), last_folder, history)
 
     # Images per Generate is clamped to 1-10: the box already
     # limits it, but a typed value can slip past, so the code
@@ -693,7 +1008,7 @@ def generate(prompt_text, negative_text, queue_text, width, height,
             folder, _run_header(start, len(frames)),
             _generate_entries(template, expanded, negative, width,
                               height, steps, guidance, sampler,
-                              seeds, offload))
+                              seeds, offload, lora_text))
         entry = {
             "prompt": template,
             "negative": negative,
@@ -826,6 +1141,15 @@ def build_ui():
                   "stage but one in RAM; unticking puts all "
                   "10.9 GB on the GPU and can run out of memory "
                   "on a 12 GB card)")
+        with gr.Row():
+            lora_dd = gr.Dropdown(
+                label="LoRA (PixArt LoRAs only -- .safetensors "
+                      "files in the loras folder)",
+                choices=_list_loras(), value="None")
+            lora_w = gr.Slider(
+                label="LoRA weight", minimum=0.0, maximum=1.5,
+                step=0.05, value=0.8)
+            lora_refresh_btn = gr.Button("Refresh list")
         batch_name = gr.Textbox(label="Batch name",
                                 value="pixart-test")
         with gr.Row():
@@ -843,12 +1167,14 @@ def build_ui():
         random_btn.click(random_prompt, outputs=[prompt])
         preset.change(_apply_preset, inputs=[preset],
                       outputs=[width, height])
+        lora_refresh_btn.click(
+            fn=_refresh_lora, inputs=[lora_dd], outputs=[lora_dd])
         generate_event = generate_btn.click(
             generate,
             inputs=[prompt, negative_prompt, queue_text, width,
                     height, steps, guidance, sampler, seed,
                     batch_name, count, offload, last_folder_state,
-                    history_state],
+                    history_state, lora_dd, lora_w],
             outputs=[gallery, status, history, last_folder_state,
                      history_state],
         )

@@ -29,6 +29,15 @@
 #     weighting, Canny preprocessor, LMS sampler, PNG prompt
 #     reading and Animation tab; PixArt-Sigma UI v1 has none of
 #     those, so the packages are not installed.
+#   peft 0.17.1 -- ADDED Oct 28, 2026, for the LoRA slot.
+#     Diffusers 0.39.0 ships no LoRA API for PixArt (the
+#     pipeline has no LoRA mixin); the app loads transformer
+#     LoRAs through diffusers' own PeftAdapterMixin loader,
+#     and every diffusers LoRA loader runs on the peft
+#     library -- without this package installed, that loader
+#     refuses with "PEFT backend is required". Re-resolved
+#     with the whole set for win_amd64 / cp310 on Oct 28,
+#     2026: 71 wheels, no conflicts (was 70).
 # The set below was resolved together with pip's resolver for
 # this build (Oct 28, 2026): every wheel was fetched for
 # win_amd64 / cp310 (the bundled Python) with no conflicts.
@@ -42,3 +51,4 @@ safetensors==0.8.0
 pillow==11.3.0
 tokenizers==0.22.2
 sentencepiece==0.2.0
+peft==0.17.1
