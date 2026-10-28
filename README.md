@@ -19,6 +19,7 @@ PixArt-Sigma is a diffusion *transformer* (not a U-Net like Stable Diffusion): a
 - **Star batch** (copies the last batch into `images_out/favorites/`, never overwrites), **Stop**, and **Unload models**.
 - Batch folders under `images_out/<batch name>/`, reused across runs, frames numbered continuously (`000001.png`, `000002.png`, …), with a `settings.txt` block per run logging **everything** — prompt as typed, the expanded prompt actually used, negative, sampler, size, steps, guidance, every seed, the model, the dtype, and which loader path ran — so any picture can be reproduced.
 - Memory is freed between images inside a run, so long queues don't creep upward.
+- Multi-image runs encode the prompt **once** and reuse the embeddings for every image in the run, so the 9.5 GB text encoder is not swept on and off the GPU per image — that keeps long batches inside the memory budget on a 16 GB machine.
 - No token, no license step: the model (`PixArt-alpha/PixArt-Sigma-XL-2-1024-MS`, OpenRAIL++ license) is public and ungated.
 
 ## Memory: why CPU offload is on

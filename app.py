@@ -50,6 +50,20 @@ Memory design -- read this before touching the loader:
   everything on the GPU at once -- on a 12 GB card that is
   expected to run out of memory; it is there for bigger cards.
 
+  Batch rule (Oct 28, 2026): a multi-image run encodes its
+  prompt ONCE, before the loop, and every image in the run
+  is then generated from those saved embeddings -- the text
+  encoder never runs inside the batch loop. Reason: with
+  CPU offload on, each full pipeline call sweeps the 9.5 GB
+  T5-XXL encoder from RAM to the GPU and back, and a
+  10-image portrait batch doing that per image exhausted
+  Windows commit memory on a 16 GB machine -- python.exe
+  died outright (error 0xc000012d, so hard that even the
+  Windows error reporter could not start). With the encode
+  done once, only the small transformer and VAE cycle per
+  image. Single-image runs keep the plain one-call path:
+  they never had the problem, so they do not change.
+
   Dtype rule (the SDXL lesson, Oct 27 2026): ONE dtype story.
   Every component loads in float16 and none is ever upcast
   against the others. Diffusers 0.39's PixArt decode line
@@ -514,16 +528,66 @@ def random_prompt():
 
 def _run_generate(pipe, template, negative, width, height, steps,
                   guidance, seeds, folder, start=1):
-    """One text-to-image generation per seed. Each image gets
-    its own fresh dynamic-prompt expansion and its own
-    generator, so each image's seed reproduces it. Frames are
-    numbered from start (6-digit), so a repeat run in a reused
-    folder continues where the last run left off. Memory is
-    freed after every image (the walk-away rule: a long queue
-    must not creep upward). Returns (frame paths, expanded
-    prompts actually used)."""
+    """One text-to-image generation per seed, each with its
+    own generator, so each image's seed reproduces it. Frames
+    are numbered from start (6-digit), so a repeat run in a
+    reused folder continues where the last run left off.
+    Memory is freed after every image (the walk-away rule: a
+    long queue must not creep upward). Returns (frame paths,
+    expanded prompts actually used).
+
+    Two paths, by seed count. A single-seed run takes the
+    plain path: one pipeline call with the prompt text,
+    expanded fresh -- the proven first-picture path,
+    unchanged. A multi-seed run encodes once (the module
+    header's batch rule): the template is expanded ONE time,
+    pipe.encode_prompt computes the embeddings before the
+    loop, and each seed is generated from those same
+    embeddings with prompt=None, so the 9.5 GB text encoder
+    never fires inside the loop and the CPU-offload hooks
+    never sweep it per image. The returned expanded list
+    repeats that one expansion once per frame, which is what
+    settings.txt records."""
     frame_paths = []
     expanded_list = []
+    if len(seeds) > 1:
+        expanded = _expand_templates(template)
+        # encode_prompt returns, in the diffusers 0.39.0
+        # wheel's own order: prompt_embeds,
+        # prompt_attention_mask, negative_prompt_embeds,
+        # negative_prompt_attention_mask (the negative pair
+        # is None when guidance is off).
+        (prompt_embeds, prompt_attention_mask,
+         negative_prompt_embeds,
+         negative_prompt_attention_mask) = pipe.encode_prompt(
+            expanded,
+            do_classifier_free_guidance=float(guidance) > 1.0,
+            negative_prompt=negative,
+            num_images_per_prompt=1,
+            clean_caption=False)
+        for i, actual_seed in enumerate(seeds):
+            generator = _make_generator(actual_seed)
+            image = pipe(
+                prompt=None,
+                prompt_embeds=prompt_embeds,
+                prompt_attention_mask=prompt_attention_mask,
+                negative_prompt_embeds=negative_prompt_embeds,
+                negative_prompt_attention_mask=(
+                    negative_prompt_attention_mask),
+                height=int(height),
+                width=int(width),
+                num_inference_steps=int(steps),
+                guidance_scale=float(guidance),
+                generator=generator,
+                clean_caption=False,
+            ).images[0]
+            frame_path = os.path.join(
+                folder, "{:06d}.png".format(start + i))
+            image.save(frame_path)
+            frame_paths.append(frame_path)
+            expanded_list.append(expanded)
+            _free_memory()
+        return frame_paths, expanded_list
     for i, actual_seed in enumerate(seeds):
         expanded = _expand_templates(template)
         generator = _make_generator(actual_seed)
