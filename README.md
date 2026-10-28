@@ -61,6 +61,10 @@ MIT licensed, like the other UIs in this family.
 
 ## Example output
 
+![Showcase](example-profile.png)
+
+*Alan's showcase pick: frame 000004 — porcelain cyborg profile with white blossoms. 1024x1024, DPM++ 2M, 50 steps, guidance 4.5, seed 421033878*
+
 ![Example output](example-cabin.png)
 
 *First picture from the published build: frame 000001 — a log cabin in a pine forest at dawn. 1024x1024, DPM++ 2M, 20 steps, guidance 4.5, seed 57534858, model CPU offload on.*
