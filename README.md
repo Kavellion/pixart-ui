@@ -6,6 +6,8 @@ PixArt-Sigma is a diffusion *transformer* (not a U-Net like Stable Diffusion): a
 
 **Status: code-verified build.** This package has passed its full stub-test suite (UI construction, sampler mapping from the checkpoint's own scheduler config, batch/settings/history helpers, a dtype-strict fake pipeline that replays the real pipeline's encode/decode dtype protocol, and end-to-end generate flows). It has **not yet had its first picture on a real PC** — that proof comes from a fresh-folder install, and this page will be updated when it lands.
 
+![PixArt-Sigma UI](ui-screenshot.png)
+
 ## What it does
 
 - **Text to image** — prompt + negative prompt, size presets (the model's own aspect buckets: Square 1024×1024, 1152×896, 896×1152, 1216×832, 832×1216, Wide 1344×768, Tall 768×1344, Cinema 1536×640, Vertical 640×1536) plus width/height sliders. Off-preset sizes are snapped by the model to its nearest trained bucket internally and resized back, so the saved picture always matches the boxes.
@@ -56,3 +58,9 @@ First Generate downloads the model (**about 22 GB** — the text encoder ships a
 - **No prompt weighting or blending, no animation, no upscaling** — possible future extras, in the family pattern, once the core is PC-proven.
 
 MIT licensed, like the other UIs in this family.
+
+## Example output
+
+![Example output](example-cabin.png)
+
+*First picture from the published build: frame 000001 — a log cabin in a pine forest at dawn. 1024x1024, DPM++ 2M, 20 steps, guidance 4.5, seed 57534858, model CPU offload on.*
