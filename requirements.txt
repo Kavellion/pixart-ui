@@ -1,0 +1,44 @@
+# PixArt-Sigma UI requirements
+#
+# torch is NOT listed here on purpose: install.bat installs it first
+# (torch 2.5.1 + torchvision 0.20.1, pinned) from PyTorch's CUDA
+# index so GPU support works (same pattern as the other UIs).
+# Everything below installs from PyPI after that.
+#
+# The diffusers / transformers / gradio pins are the same matched
+# set as the SD 1.5 / SDXL UIs (see the PINNED TRIO note). Do not
+# change one without re-checking the others.
+
+# PINNED TRIO -- change these three together, never one alone.
+# diffusers, transformers and gradio all depend on huggingface-hub,
+# and their hub ranges must overlap, or pip refuses
+# (ResolutionImpossible):
+#   diffusers 0.39.0 needs hub [0.34, 2.0)
+#   transformers 4.57.1 needs hub [0.34, 1.0)
+#   gradio 5.39.0 needs hub [0.33.5, 1.0)
+# All three agree on huggingface-hub 0.36.2.
+#
+# Changes from the SDXL UI set, for PixArt-Sigma's simpler core:
+#   sentencepiece 0.2.0 -- ADDED. PixArt-Sigma's text encoder is
+#     T5-XXL and its tokenizer is the (slow) T5Tokenizer, which
+#     loads the repo's spiece.model through sentencepiece. Without
+#     this package the pipeline cannot tokenize at all. The model
+#     card's own install list names it too.
+#   compel, opencv-python-headless, scipy, piexif and
+#     imageio-ffmpeg -- DROPPED. They served SDXL's prompt
+#     weighting, Canny preprocessor, LMS sampler, PNG prompt
+#     reading and Animation tab; PixArt-Sigma UI v1 has none of
+#     those, so the packages are not installed.
+# The set below was resolved together with pip's resolver for
+# this build (Oct 28, 2026): every wheel was fetched for
+# win_amd64 / cp310 (the bundled Python) with no conflicts.
+
+diffusers==0.39.0
+transformers==4.57.1
+gradio==5.39.0
+huggingface_hub==0.36.2
+accelerate==1.15.0
+safetensors==0.8.0
+pillow==11.3.0
+tokenizers==0.22.2
+sentencepiece==0.2.0
