@@ -4,7 +4,7 @@
 
 PixArt-Sigma is a diffusion *transformer* (not a U-Net like Stable Diffusion): a T5-XXL text encoder with a 300-token prompt budget — far past CLIP's 77 — feeding a 0.6B transformer that paints at a native 1024px in a family of aspect ratios. This app wraps it in the same plain shape as the other UIs in this family (Kandinsky, Sana, Z-Image, SD 3.5, SD 1.5, SDXL): run it, a page opens in your browser, type a prompt, pictures appear. Simple on the surface, everything underneath, clean looking.
 
-**Status: PC-proven build.** First picture verified on a real PC on Oct 28, 2026 (RTX 4070 12 GB, 16 GB system RAM): frame 000001, a log cabin in a pine forest at dawn — see Example output below — with many more renders since. Single-image generation runs at full speed. Multi-image batches on 16 GB RAM systems have a known issue — see **Known issues** below before running long batches.
+**Status: PC-proven build.** First picture verified on a real PC on Oct 28, 2026 (RTX 4070 12 GB, 16 GB system RAM): frame 000001, a log cabin in a pine forest at dawn — see Example output below — with many more renders since. Single-image generation runs at full speed, and since v1.2 multi-image batches and prompt queues run at the same per-image pace — PC-proven Oct 30, 2026 (see **Changes in v1.2** below).
 
 ![PixArt-Sigma UI](ui-screenshot.png)
 
@@ -22,7 +22,7 @@ PixArt-Sigma is a diffusion *transformer* (not a U-Net like Stable Diffusion): a
 - **Star batch** (copies the last batch into `images_out/favorites/`, never overwrites), **Stop**, and **Unload models**.
 - Batch folders under `images_out/<batch name>/`, reused across runs, frames numbered continuously (`000001.png`, `000002.png`, …), with a `settings.txt` block per run logging **everything** — prompt as typed, the expanded prompt actually used, negative, sampler, size, steps, guidance, every seed, the model, the dtype, and which loader path ran — so any picture can be reproduced.
 - Memory is freed between images inside a run, so long queues don't creep upward.
-- Multi-image runs encode the prompt **once** and reuse the embeddings for every image in the run, so the 9.5 GB text encoder is not swept on and off the GPU per image — that keeps long batches inside the memory budget on a 16 GB machine.
+- Every image in a multi-image run goes through exactly the same call as a single image — prompt text in, picture out, the pipeline encoding per image — which is what keeps batches at single-image pace on a 16 GB machine (v1.2; see **Changes in v1.2** for why the earlier encode-once design was removed).
 - No token, no license step: the model (`PixArt-alpha/PixArt-Sigma-XL-2-1024-MS`, OpenRAIL++ license) is public and ungated.
 
 ## Memory: why CPU offload is on
@@ -43,9 +43,14 @@ PixArt is a transformer, so a PixArt LoRA patches the transformer's attention an
 - **One slot:** there is deliberately one slot, not two. Under the pinned Diffusers 0.39.0 loader, a second adapter does not load cleanly on this transformer (verified against the real model classes when this was built), so the app ships the one slot that is proven rather than a second that fails on real files.
 - Diffusers 0.39.0 ships no LoRA support for the PixArt pipeline itself; this app loads the adapter through Diffusers' own transformer-level PEFT loader — the same code its supported DiT pipelines delegate to — with the `peft` package pinned in `requirements.txt`. **install.bat installs the peft library the slot needs**, along with the other packages, so a fresh install needs no extra step. If you are updating an existing install by swapping in the new `app.py`, re-run install.bat once so peft gets installed.
 
+## Changes in v1.2 (Oct 30, 2026)
+
+- **Batch path rebuilt.** Batches, prompt queues and singles all run through the one per-image generation path. On the bench PC (RTX 4070 12 GB, 16 GB RAM, 1024x1024, 20 steps) a batch image went from ~280 s on the old path to ~27 s — the same pace as a single. Proof session: 12 consecutive images (2-image batch, then a 2-prompt queue at 5 images each), every image at pace, no slowdown, no exit.
+- Nothing else changed: same UI, same LoRA slot, same settings format. Updating an existing install is an app.py swap only — no install.bat re-run.
+
 ## Known issues
 
-- **Multi-image batches on 16 GB RAM systems:** Multi-image batches currently run much slower per image than single images on 16 GB RAM systems (observed ~12 s/step in batch vs ~1.25 s/step single at 1024×1024) and long batches can strain system memory. Single-image generation runs at full speed and is recommended for now. A first fix attempt (Oct 28) did not cure the batch pace; investigation is ongoing.
+- **Multi-image batches (fixed in v1.2):** in v1.1 and earlier, batches on 16 GB RAM systems ran roughly ten times slower per image than singles. A controlled A/B/C bench on Oct 30, 2026 isolated the cause to the encode-once embedding pass-through path; v1.2 generates every image through the single-image path instead. PC-proven the same day: a 5-image batch plus a 2-prompt queue in one session, every image at single pace, no exit.
 
 ## Install
 
